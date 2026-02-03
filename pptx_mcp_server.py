@@ -1,14 +1,10 @@
 """
-Claude Skills MCP Server - PPTX Edition
+Claude Skills MCP Server - PPTX Edition with SSE Support
 Python server for reading and modifying PowerPoint templates
-
-Required libraries:
-pip install python-pptx requests flask flask-cors
-
-Deploy on: Railway.app, Render.com, or Fly.io
+Supports both JSON-RPC and SSE transports for DUST compatibility
 """
 
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
@@ -17,6 +13,7 @@ import io
 import json
 import tempfile
 import os
+import time
 from datetime import datetime
 
 app = Flask(__name__)
@@ -109,33 +106,17 @@ def modify_presentation(prs, modifications):
     return prs
 
 
-@app.route('/api/mcp', methods=['GET', 'POST', 'OPTIONS'])
-def mcp_endpoint():
-    """Main MCP endpoint following JSON-RPC 2.0"""
-    
-    if request.method == 'OPTIONS':
-        return '', 200
-    
-    if request.method == 'GET':
-        return jsonify({
-            "name": "PPTX MCP Server",
-            "version": "1.0.0",
-            "tools": ["analyze_template", "modify_template", "list_tools"]
-        })
-    
-    # Handle POST - JSON-RPC
-    body = request.get_json()
-    request_id = body.get('id', 1)
+def handle_mcp_request(body, request_id):
+    """Handle MCP JSON-RPC request and return response"""
     method = body.get('method', '')
     params = body.get('params', {})
     
     print(f"📥 Method: {method}")
-    print(f"📥 Params: {json.dumps(params, indent=2)}")
     
     # Route: initialize
     if method == 'initialize':
         client_version = params.get('protocolVersion', '2025-06-18')
-        return jsonify({
+        return {
             "jsonrpc": "2.0",
             "id": request_id,
             "result": {
@@ -150,11 +131,11 @@ def mcp_endpoint():
                     "version": "1.0.0"
                 }
             }
-        })
+        }
     
     # Route: tools/list
     if method == 'tools/list':
-        return jsonify({
+        return {
             "jsonrpc": "2.0",
             "id": request_id,
             "result": {
@@ -193,7 +174,7 @@ def mcp_endpoint():
                     }
                 ]
             }
-        })
+        }
     
     # Route: tools/call
     if method == 'tools/call':
@@ -204,14 +185,12 @@ def mcp_endpoint():
         if tool_name == 'analyze_template':
             try:
                 template_url = args.get('template_url')
-                
                 print(f"📄 Analyzing template: {template_url}")
                 
-                # Download and analyze
                 prs = download_pptx(template_url)
                 analysis = analyze_presentation(prs)
                 
-                return jsonify({
+                return {
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "result": {
@@ -220,17 +199,16 @@ def mcp_endpoint():
                             "text": json.dumps(analysis, indent=2, ensure_ascii=False)
                         }]
                     }
-                })
-            
+                }
             except Exception as e:
-                return jsonify({
+                return {
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "error": {
                         "code": -32603,
                         "message": f"Error analyzing template: {str(e)}"
                     }
-                })
+                }
         
         # Tool: modify_template
         if tool_name == 'modify_template':
@@ -239,26 +217,19 @@ def mcp_endpoint():
                 modifications = args.get('modifications', {})
                 
                 print(f"✏️ Modifying template: {template_url}")
-                print(f"✏️ Modifications: {json.dumps(modifications, indent=2)}")
                 
-                # Download template
                 prs = download_pptx(template_url)
-                
-                # Apply modifications
                 prs = modify_presentation(prs, modifications)
                 
-                # Save to temporary file
                 output_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pptx')
                 prs.save(output_file.name)
                 
-                # Store file path with timestamp
                 file_id = f"pptx_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                 temp_files[file_id] = output_file.name
                 
-                # Generate download URL
                 download_url = f"/download/{file_id}"
                 
-                return jsonify({
+                return {
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "result": {
@@ -267,37 +238,91 @@ def mcp_endpoint():
                             "text": f"✅ Template modifié avec succès!\n\nTélécharger: {download_url}\n\nModifications appliquées: {len(modifications)} slides"
                         }]
                     }
-                })
-            
+                }
             except Exception as e:
-                return jsonify({
+                return {
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "error": {
                         "code": -32603,
                         "message": f"Error modifying template: {str(e)}"
                     }
-                })
+                }
         
         # Unknown tool
-        return jsonify({
+        return {
             "jsonrpc": "2.0",
             "id": request_id,
             "error": {
                 "code": -32601,
                 "message": f"Unknown tool: {tool_name}"
             }
-        })
+        }
     
     # Unknown method
-    return jsonify({
+    return {
         "jsonrpc": "2.0",
         "id": request_id,
         "error": {
             "code": -32601,
             "message": f"Method not found: {method}"
         }
-    })
+    }
+
+
+@app.route('/api/mcp', methods=['GET', 'POST', 'OPTIONS'])
+def mcp_endpoint():
+    """Main MCP endpoint - supports both JSON and SSE transports"""
+    
+    if request.method == 'OPTIONS':
+        return '', 200
+    
+    if request.method == 'GET':
+        return jsonify({
+            "name": "PPTX MCP Server",
+            "version": "1.0.0",
+            "tools": ["analyze_template", "modify_template"]
+        })
+    
+    # Handle POST - check if client wants SSE
+    accept_header = request.headers.get('Accept', '')
+    wants_sse = 'text/event-stream' in accept_header
+    
+    print(f"📥 Accept header: {accept_header}")
+    print(f"📥 Wants SSE: {wants_sse}")
+    
+    body = request.get_json() or {}
+    request_id = body.get('id', 1)
+    
+    # If SSE is requested, use SSE transport
+    if wants_sse:
+        print("🔄 Using SSE transport")
+        
+        def generate_sse():
+            # Process the request
+            response_data = handle_mcp_request(body, request_id)
+            
+            # Send as SSE event
+            sse_data = f"data: {json.dumps(response_data)}\n\n"
+            yield sse_data
+            
+            # Keep connection alive briefly
+            time.sleep(0.5)
+        
+        return Response(
+            generate_sse(),
+            mimetype='text/event-stream',
+            headers={
+                'Cache-Control': 'no-cache',
+                'X-Accel-Buffering': 'no',
+                'Connection': 'keep-alive'
+            }
+        )
+    
+    # Otherwise use standard JSON response
+    print("📤 Using JSON transport")
+    response_data = handle_mcp_request(body, request_id)
+    return jsonify(response_data)
 
 
 @app.route('/download/<file_id>')
@@ -325,7 +350,8 @@ def health():
     return jsonify({
         "status": "healthy",
         "server": "pptx-mcp-server",
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "transport": "JSON + SSE"
     })
 
 
