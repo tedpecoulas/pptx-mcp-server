@@ -15,12 +15,23 @@ import tempfile
 import os
 import time
 from datetime import datetime
+import re
 
 app = Flask(__name__)
 CORS(app)
 
 # Store modified presentations temporarily
 temp_files = {}
+
+
+def sanitize_filename(text):
+    """Sanitize text for use in filename"""
+    # Remove or replace invalid characters
+    text = re.sub(r'[<>:"/\\|?*]', '-', text)
+    # Remove leading/trailing spaces and dots
+    text = text.strip(' .')
+    # Limit length
+    return text[:50] if text else "Document"
 
 
 def download_pptx(url):
@@ -167,6 +178,15 @@ def handle_mcp_request(body, request_id):
                                 "modifications": {
                                     "type": "object",
                                     "description": "Dictionnaire des modifications (slide_X: {shape_Y: nouveau_texte})"
+                                },
+                                "metadata": {
+                                    "type": "object",
+                                    "description": "Métadonnées optionnelles pour nommer le fichier (client, mission, consultant)",
+                                    "properties": {
+                                        "client": {"type": "string"},
+                                        "mission": {"type": "string"},
+                                        "consultant": {"type": "string"}
+                                    }
                                 }
                             },
                             "required": ["template_url", "modifications"]
@@ -215,19 +235,44 @@ def handle_mcp_request(body, request_id):
             try:
                 template_url = args.get('template_url')
                 modifications = args.get('modifications', {})
+                metadata = args.get('metadata', {})
                 
                 print(f"✏️ Modifying template: {template_url}")
+                print(f"✏️ Metadata: {metadata}")
                 
                 prs = download_pptx(template_url)
                 prs = modify_presentation(prs, modifications)
                 
+                # Generate filename from metadata
+                client = sanitize_filename(metadata.get('client', ''))
+                mission = sanitize_filename(metadata.get('mission', ''))
+                consultant = sanitize_filename(metadata.get('consultant', ''))
+                
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                file_id = f"pptx_{timestamp}"
+                
+                # Build suggested filename
+                if client and mission and consultant:
+                    suggested_name = f"REX - {client} - {mission} - {consultant}.pptx"
+                elif client and mission:
+                    suggested_name = f"REX - {client} - {mission}.pptx"
+                elif client:
+                    suggested_name = f"REX - {client}.pptx"
+                else:
+                    suggested_name = f"REX_{timestamp}.pptx"
+                
+                # Save file
                 output_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pptx')
                 prs.save(output_file.name)
                 
-                file_id = f"pptx_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                temp_files[file_id] = output_file.name
+                temp_files[file_id] = {
+                    'path': output_file.name,
+                    'suggested_name': suggested_name
+                }
                 
-                download_url = f"/download/{file_id}"
+                # Construct full URL
+                base_url = os.environ.get('SERVER_URL', 'https://pptx-mcp-server-production.up.railway.app')
+                download_url = f"{base_url}/download/{file_id}"
                 
                 return {
                     "jsonrpc": "2.0",
@@ -235,11 +280,12 @@ def handle_mcp_request(body, request_id):
                     "result": {
                         "content": [{
                             "type": "text",
-                            "text": f"✅ Template modifié avec succès!\n\nTélécharger: {download_url}\n\nModifications appliquées: {len(modifications)} slides"
+                            "text": f"✅ Votre REX est prêt !\n\n📥 Télécharger ici: {download_url}\n\n💡 Nom de fichier: {suggested_name}\n\n(Le fichier se téléchargera avec ce nom automatiquement)"
                         }]
                     }
                 }
             except Exception as e:
+                print(f"❌ Error: {str(e)}")
                 return {
                     "jsonrpc": "2.0",
                     "id": request_id,
@@ -331,7 +377,9 @@ def download_file(file_id):
     if file_id not in temp_files:
         return jsonify({"error": "File not found"}), 404
     
-    file_path = temp_files[file_id]
+    file_info = temp_files[file_id]
+    file_path = file_info['path']
+    suggested_name = file_info['suggested_name']
     
     if not os.path.exists(file_path):
         return jsonify({"error": "File no longer exists"}), 404
@@ -340,7 +388,7 @@ def download_file(file_id):
         file_path,
         mimetype='application/vnd.openxmlformats-officedocument.presentationml.presentation',
         as_attachment=True,
-        download_name=f'modified_{file_id}.pptx'
+        download_name=suggested_name
     )
 
 
