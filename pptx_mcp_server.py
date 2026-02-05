@@ -1,7 +1,7 @@
 """
 Claude Skills MCP Server - PPTX Edition with SSE Support
 Python server for reading and modifying PowerPoint templates
-WITH INTELLIGENT FONT AUTO-SIZING v2.0 - Dual Group Management
+WITH INTELLIGENT FONT AUTO-SIZING v2.1 - Dual Group + Bullet Points
 """
 
 from flask import Flask, request, jsonify, send_file, Response
@@ -48,7 +48,7 @@ def sanitize_filename(text):
 
 def download_pptx(url):
     """Download PPTX from URL and return Presentation object"""
-    response = requests.get(url)
+    response = requests.get(url, timeout=30)
     response.raise_for_status()
     pptx_bytes = io.BytesIO(response.content)
     return Presentation(pptx_bytes)
@@ -92,8 +92,7 @@ def estimate_text_height(text, font_size, shape_width, line_spacing=1.2):
     - Interligne
     """
     # Estimation du nombre de caractères par ligne selon la largeur et la taille de police
-    # Approximation : 1 caractère ≈ 0.6 * font_size en points
-    chars_per_inch = 72 / (font_size * 0.6)  # 72 points = 1 inch
+    chars_per_inch = 72 / (font_size * 0.6)
     shape_width_points = shape_width.inches * 72
     chars_per_line = shape_width_points / (font_size * 0.6)
     
@@ -160,31 +159,76 @@ def find_optimal_font_size(texts_and_shapes, max_size=DEFAULT_FONT_SIZE, min_siz
     return optimal_size
 
 
+def format_bullet_points(text):
+    """
+    Améliore le formatage des bullet points pour un meilleur rendu visuel
+    """
+    if not text:
+        return text
+    
+    # Si le texte contient des bullets
+    if '•' in text or text.strip().startswith('-'):
+        lines = text.split('\n')
+        formatted_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Normaliser les bullets
+            if line.startswith('-'):
+                line = '• ' + line[1:].strip()
+            elif line.startswith('•') and len(line) > 1 and line[1] != ' ':
+                line = '• ' + line[1:].strip()
+            elif not line.startswith('•'):
+                # Si pas de bullet, en ajouter un
+                line = '• ' + line
+            
+            formatted_lines.append(line)
+        
+        return '\n'.join(formatted_lines)
+    
+    return text
+
+
 def apply_text_with_formatting(shape, text, font_size, line_spacing=1.2):
     """
-    Applique le texte avec formatage (police, interligne)
+    Applique le texte avec formatage optimisé (police, interligne, bullets)
     """
     if not shape.has_text_frame:
         return False
+    
+    # Améliorer le formatage des bullet points
+    text = format_bullet_points(text)
     
     text_frame = shape.text_frame
     text_frame.clear()
     text_frame.word_wrap = True
     text_frame.auto_size = MSO_AUTO_SIZE.NONE
     
-    # Ajouter le texte
-    p = text_frame.paragraphs[0]
-    p.text = text
-    p.alignment = PP_PARAGRAPH_ALIGNMENT.LEFT
+    # Séparer les lignes
+    lines = text.split('\n')
     
-    # Appliquer la taille de police et l'interligne
-    for paragraph in text_frame.paragraphs:
-        paragraph.line_spacing = line_spacing
+    for i, line in enumerate(lines):
+        if i == 0:
+            p = text_frame.paragraphs[0]
+        else:
+            p = text_frame.add_paragraph()
         
-        for run in paragraph.runs:
+        p.text = line
+        p.alignment = PP_PARAGRAPH_ALIGNMENT.LEFT
+        p.line_spacing = line_spacing
+        
+        # Espacement léger entre les bullets pour l'esthétique
+        if line.strip().startswith('•'):
+            p.space_before = Pt(3)
+            p.space_after = Pt(1)
+        
+        for run in p.runs:
             run.font.size = Pt(font_size)
     
-    print(f"  ✍️  Shape '{shape.name}': {len(text)} chars → {font_size}pt, interligne {line_spacing}")
+    print(f"  ✍️  Shape '{shape.name}': {len(text)} chars, {len(lines)} lines → {font_size}pt")
     return True
 
 
@@ -362,7 +406,7 @@ def handle_mcp_request(body, request_id):
                     },
                     {
                         "name": "modify_template",
-                        "description": "Modifie un template PowerPoint avec ajustement intelligent de la police en 2 groupes indépendants et interligne optimisé",
+                        "description": "Modifie un template PowerPoint avec ajustement intelligent de la police en 2 groupes indépendants, interligne optimisé et formatage des bullet points",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -488,6 +532,8 @@ def handle_mcp_request(body, request_id):
                 }
             except Exception as e:
                 print(f"❌ Error: {str(e)}")
+                import traceback
+                traceback.print_exc()
                 return {
                     "jsonrpc": "2.0",
                     "id": request_id,
@@ -533,7 +579,8 @@ def mcp_endpoint():
             "features": [
                 "dual_group_font_sizing",
                 "intelligent_height_calculation",
-                "line_spacing_optimization"
+                "line_spacing_optimization",
+                "bullet_point_formatting"
             ],
             "groups": {
                 "group_1": GROUP_1_SHAPES,
@@ -603,6 +650,7 @@ def health():
         "features": {
             "dual_group_sizing": True,
             "intelligent_height_calc": True,
+            "bullet_formatting": True,
             "line_spacing": LINE_SPACING,
             "group_1": GROUP_1_SHAPES,
             "group_2": GROUP_2_SHAPES,
