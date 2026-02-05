@@ -2,12 +2,15 @@
 Claude Skills MCP Server - PPTX Edition with SSE Support
 Python server for reading and modifying PowerPoint templates
 Supports both JSON-RPC and SSE transports for DUST compatibility
+WITH INTELLIGENT FONT AUTO-SIZING
 """
 
 from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.util import Pt
+from pptx.enum.text import MSO_AUTO_SIZE
 import requests
 import io
 import json
@@ -23,14 +26,24 @@ CORS(app)
 # Store modified presentations temporarily
 temp_files = {}
 
+# Configuration des cadres à formater uniformément
+UNIFORM_FORMAT_SHAPES = [
+    "contexte",
+    "travaux réalisés", 
+    "type de mission",
+    "outils utilisés",
+    "résultats"
+]
+
+# Taille de police par défaut et minimale
+DEFAULT_FONT_SIZE = 12
+MIN_FONT_SIZE = 8
+
 
 def sanitize_filename(text):
     """Sanitize text for use in filename"""
-    # Remove or replace invalid characters
     text = re.sub(r'[<>:"/\\|?*]', '-', text)
-    # Remove leading/trailing spaces and dots
     text = text.strip(' .')
-    # Limit length
     return text[:50] if text else "Document"
 
 
@@ -40,6 +53,86 @@ def download_pptx(url):
     response.raise_for_status()
     pptx_bytes = io.BytesIO(response.content)
     return Presentation(pptx_bytes)
+
+
+def normalize_shape_name(name):
+    """Normalise le nom d'une shape pour comparaison"""
+    return name.lower().strip()
+
+
+def is_uniform_format_shape(shape):
+    """Vérifie si une shape fait partie des cadres à formater uniformément"""
+    if not shape.has_text_frame:
+        return False
+    
+    shape_name_normalized = normalize_shape_name(shape.name)
+    
+    # Vérifier si le nom de la shape contient un des mots-clés
+    for keyword in UNIFORM_FORMAT_SHAPES:
+        if keyword.lower() in shape_name_normalized:
+            return True
+    
+    # Vérifier aussi le texte actuel de la shape (cas des placeholders)
+    if shape.text_frame.text:
+        text_normalized = normalize_shape_name(shape.text_frame.text)
+        for keyword in UNIFORM_FORMAT_SHAPES:
+            if keyword.lower() in text_normalized:
+                return True
+    
+    return False
+
+
+def calculate_optimal_font_size(texts, max_size=DEFAULT_FONT_SIZE, min_size=MIN_FONT_SIZE):
+    """
+    Calcule la taille de police optimale pour plusieurs textes
+    en se basant sur le texte le plus long
+    """
+    if not texts:
+        return max_size
+    
+    # Trouver la longueur maximale
+    max_length = max(len(text) for text in texts if text)
+    
+    # Calculer la taille optimale selon la longueur
+    if max_length < 100:
+        font_size = max_size
+    elif max_length < 200:
+        font_size = max_size - 1
+    elif max_length < 300:
+        font_size = max_size - 2
+    elif max_length < 500:
+        font_size = max_size - 3
+    else:
+        font_size = min_size
+    
+    # S'assurer de ne pas descendre sous la taille minimale
+    font_size = max(font_size, min_size)
+    
+    print(f"📏 [FONT-CALC] Max length: {max_length} chars → Font size: {font_size}pt")
+    return font_size
+
+
+def apply_font_size_to_shape(shape, text, font_size):
+    """Applique une taille de police à une shape"""
+    if not shape.has_text_frame:
+        return False
+    
+    text_frame = shape.text_frame
+    text_frame.clear()
+    text_frame.word_wrap = True
+    text_frame.auto_size = MSO_AUTO_SIZE.NONE
+    
+    # Ajouter le texte
+    p = text_frame.paragraphs[0]
+    p.text = text
+    
+    # Appliquer la taille de police à tous les runs
+    for paragraph in text_frame.paragraphs:
+        for run in paragraph.runs:
+            run.font.size = Pt(font_size)
+    
+    print(f"✍️  [APPLY-FONT] Shape '{shape.name}': {len(text)} chars → {font_size}pt")
+    return True
 
 
 def analyze_presentation(prs):
@@ -61,25 +154,22 @@ def analyze_presentation(prs):
                 "shape_id": shape_idx,
                 "name": shape.name,
                 "type": str(shape.shape_type),
-                "has_text_frame": shape.has_text_frame
+                "has_text_frame": shape.has_text_frame,
+                "is_uniform_format": is_uniform_format_shape(shape)
             }
             
-            # Extract text if available
             if shape.has_text_frame:
                 text = shape.text_frame.text
                 shape_info["text"] = text
                 shape_info["text_length"] = len(text)
                 
-                # Check if it's a placeholder
                 if shape.is_placeholder:
                     shape_info["placeholder_type"] = str(shape.placeholder_format.type)
                 else:
                     shape_info["placeholder_type"] = None
                 
-                # Count paragraphs
                 shape_info["paragraph_count"] = len(shape.text_frame.paragraphs)
             
-            # Check if it's a picture
             if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
                 shape_info["is_picture"] = True
             
@@ -91,9 +181,15 @@ def analyze_presentation(prs):
 
 
 def modify_presentation(prs, modifications):
-    """Modify presentation based on modifications dict"""
+    """
+    Modifie la présentation avec ajustement intelligent de la police
+    """
+    warnings = []
+    
+    # Phase 1 : Identifier les shapes uniformes et leurs textes
+    uniform_shapes_data = []
+    
     for slide_key, shape_mods in modifications.items():
-        # Extract slide number from "slide_0" format
         slide_num = int(slide_key.split('_')[1])
         
         if slide_num >= len(prs.slides):
@@ -102,7 +198,6 @@ def modify_presentation(prs, modifications):
         slide = prs.slides[slide_num]
         
         for shape_key, new_text in shape_mods.items():
-            # Extract shape number from "shape_0" format
             shape_num = int(shape_key.split('_')[1])
             
             if shape_num >= len(slide.shapes):
@@ -110,11 +205,62 @@ def modify_presentation(prs, modifications):
             
             shape = slide.shapes[shape_num]
             
-            if shape.has_text_frame:
-                # Replace text while preserving formatting
-                shape.text_frame.text = new_text
+            if is_uniform_format_shape(shape):
+                uniform_shapes_data.append({
+                    'shape': shape,
+                    'text': new_text,
+                    'slide_num': slide_num,
+                    'shape_num': shape_num
+                })
     
-    return prs
+    # Phase 2 : Calculer la taille de police optimale pour les shapes uniformes
+    uniform_font_size = DEFAULT_FONT_SIZE
+    if uniform_shapes_data:
+        uniform_texts = [data['text'] for data in uniform_shapes_data]
+        uniform_font_size = calculate_optimal_font_size(uniform_texts)
+        
+        print(f"🎯 [UNIFORM] {len(uniform_shapes_data)} shapes with uniform font: {uniform_font_size}pt")
+        
+        # Vérifier si on est à la taille minimale
+        if uniform_font_size == MIN_FONT_SIZE:
+            max_length = max(len(text) for text in uniform_texts)
+            warnings.append(
+                f"⚠️ ATTENTION : Un ou plusieurs cadres (Contexte, Travaux, etc.) "
+                f"contiennent beaucoup de texte ({max_length} caractères max). "
+                f"La police a été réduite au minimum ({MIN_FONT_SIZE}pt). "
+                f"Pour une meilleure lisibilité, réduisez le contenu à ~300-400 caractères."
+            )
+    
+    # Phase 3 : Appliquer les modifications
+    for slide_key, shape_mods in modifications.items():
+        slide_num = int(slide_key.split('_')[1])
+        
+        if slide_num >= len(prs.slides):
+            continue
+        
+        slide = prs.slides[slide_num]
+        
+        for shape_key, new_text in shape_mods.items():
+            shape_num = int(shape_key.split('_')[1])
+            
+            if shape_num >= len(slide.shapes):
+                continue
+            
+            shape = slide.shapes[shape_num]
+            
+            if not shape.has_text_frame:
+                continue
+            
+            # Appliquer la taille de police appropriée
+            if is_uniform_format_shape(shape):
+                # Shapes uniformes : même taille pour toutes
+                apply_font_size_to_shape(shape, new_text, uniform_font_size)
+            else:
+                # Autres shapes : calcul individuel
+                individual_font_size = calculate_optimal_font_size([new_text])
+                apply_font_size_to_shape(shape, new_text, individual_font_size)
+    
+    return prs, warnings
 
 
 def handle_mcp_request(body, request_id):
@@ -139,7 +285,7 @@ def handle_mcp_request(body, request_id):
                 },
                 "serverInfo": {
                     "name": "pptx-mcp-server",
-                    "version": "1.0.0"
+                    "version": "2.0.0"
                 }
             }
         }
@@ -167,7 +313,7 @@ def handle_mcp_request(body, request_id):
                     },
                     {
                         "name": "modify_template",
-                        "description": "Modifie un template PowerPoint en remplaçant le texte dans les zones identifiées",
+                        "description": "Modifie un template PowerPoint avec ajustement automatique de la police pour éviter les débordements",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -181,7 +327,7 @@ def handle_mcp_request(body, request_id):
                                 },
                                 "metadata": {
                                     "type": "object",
-                                    "description": "Métadonnées optionnelles pour nommer le fichier (client, mission, consultant)",
+                                    "description": "Métadonnées pour nommer le fichier (client, mission, consultant)",
                                     "properties": {
                                         "client": {"type": "string"},
                                         "mission": {"type": "string"},
@@ -241,7 +387,7 @@ def handle_mcp_request(body, request_id):
                 print(f"✏️ Metadata: {metadata}")
                 
                 prs = download_pptx(template_url)
-                prs = modify_presentation(prs, modifications)
+                prs, warnings = modify_presentation(prs, modifications)
                 
                 # Generate filename from metadata
                 client = sanitize_filename(metadata.get('client', ''))
@@ -274,13 +420,20 @@ def handle_mcp_request(body, request_id):
                 base_url = os.environ.get('SERVER_URL', 'https://pptx-mcp-server-production.up.railway.app')
                 download_url = f"{base_url}/download/{file_id}"
                 
+                # Construire le message de réponse
+                response_text = f"✅ Votre REX est prêt !\n\n📥 Télécharger ici: {download_url}\n\n💡 Nom de fichier: {suggested_name}\n\n"
+                
+                # Ajouter les warnings si présents
+                if warnings:
+                    response_text += "\n" + "\n\n".join(warnings)
+                
                 return {
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "result": {
                         "content": [{
                             "type": "text",
-                            "text": f"✅ Votre REX est prêt !\n\n📥 Télécharger ici: {download_url}\n\n💡 Nom de fichier: {suggested_name}\n\n(Le fichier se téléchargera avec ce nom automatiquement)"
+                            "text": response_text
                         }]
                     }
                 }
@@ -326,8 +479,9 @@ def mcp_endpoint():
     if request.method == 'GET':
         return jsonify({
             "name": "PPTX MCP Server",
-            "version": "1.0.0",
-            "tools": ["analyze_template", "modify_template"]
+            "version": "2.0.0",
+            "tools": ["analyze_template", "modify_template"],
+            "features": ["intelligent_font_sizing", "uniform_format_shapes"]
         })
     
     # Handle POST - check if client wants SSE
@@ -345,14 +499,9 @@ def mcp_endpoint():
         print("🔄 Using SSE transport")
         
         def generate_sse():
-            # Process the request
             response_data = handle_mcp_request(body, request_id)
-            
-            # Send as SSE event
             sse_data = f"data: {json.dumps(response_data)}\n\n"
             yield sse_data
-            
-            # Keep connection alive briefly
             time.sleep(0.5)
         
         return Response(
@@ -398,8 +547,14 @@ def health():
     return jsonify({
         "status": "healthy",
         "server": "pptx-mcp-server",
-        "version": "1.0.0",
-        "transport": "JSON + SSE"
+        "version": "2.0.0",
+        "transport": "JSON + SSE",
+        "features": {
+            "intelligent_font_sizing": True,
+            "uniform_format_shapes": UNIFORM_FORMAT_SHAPES,
+            "min_font_size": MIN_FONT_SIZE,
+            "default_font_size": DEFAULT_FONT_SIZE
+        }
     })
 
 
