@@ -1,16 +1,15 @@
 """
 Claude Skills MCP Server - PPTX Edition with SSE Support
 Python server for reading and modifying PowerPoint templates
-Supports both JSON-RPC and SSE transports for DUST compatibility
-WITH INTELLIGENT FONT AUTO-SIZING
+WITH INTELLIGENT FONT AUTO-SIZING v2.0 - Dual Group Management
 """
 
 from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
-from pptx.util import Pt
-from pptx.enum.text import MSO_AUTO_SIZE
+from pptx.util import Pt, Inches
+from pptx.enum.text import MSO_AUTO_SIZE, PP_PARAGRAPH_ALIGNMENT
 import requests
 import io
 import json
@@ -19,6 +18,7 @@ import os
 import time
 from datetime import datetime
 import re
+import math
 
 app = Flask(__name__)
 CORS(app)
@@ -26,18 +26,17 @@ CORS(app)
 # Store modified presentations temporarily
 temp_files = {}
 
-# Configuration des cadres à formater uniformément
-UNIFORM_FORMAT_SHAPES = [
-    "contexte",
-    "travaux réalisés", 
-    "type de mission",
-    "outils utilisés",
-    "résultats"
-]
+# Configuration des groupes de formattage
+GROUP_1_SHAPES = ["contexte", "résultats", "travaux réalisés"]
+GROUP_2_SHAPES = ["type de mission", "outils utilisés"]
 
 # Taille de police par défaut et minimale
 DEFAULT_FONT_SIZE = 12
 MIN_FONT_SIZE = 8
+MAX_FONT_SIZE = 14
+
+# Interligne pour esthétique (1.0 = simple, 1.5 = un demi, 2.0 = double)
+LINE_SPACING = 1.2
 
 
 def sanitize_filename(text):
@@ -60,60 +59,111 @@ def normalize_shape_name(name):
     return name.lower().strip()
 
 
-def is_uniform_format_shape(shape):
-    """Vérifie si une shape fait partie des cadres à formater uniformément"""
+def get_shape_group(shape):
+    """
+    Détermine à quel groupe appartient une shape
+    Retourne 1, 2, ou None
+    """
     if not shape.has_text_frame:
-        return False
+        return None
     
     shape_name_normalized = normalize_shape_name(shape.name)
+    shape_text_normalized = normalize_shape_name(shape.text_frame.text) if shape.text_frame.text else ""
     
-    # Vérifier si le nom de la shape contient un des mots-clés
-    for keyword in UNIFORM_FORMAT_SHAPES:
-        if keyword.lower() in shape_name_normalized:
-            return True
+    # Vérifier Groupe 1
+    for keyword in GROUP_1_SHAPES:
+        if keyword.lower() in shape_name_normalized or keyword.lower() in shape_text_normalized:
+            return 1
     
-    # Vérifier aussi le texte actuel de la shape (cas des placeholders)
-    if shape.text_frame.text:
-        text_normalized = normalize_shape_name(shape.text_frame.text)
-        for keyword in UNIFORM_FORMAT_SHAPES:
-            if keyword.lower() in text_normalized:
-                return True
+    # Vérifier Groupe 2
+    for keyword in GROUP_2_SHAPES:
+        if keyword.lower() in shape_name_normalized or keyword.lower() in shape_text_normalized:
+            return 2
     
-    return False
+    return None
 
 
-def calculate_optimal_font_size(texts, max_size=DEFAULT_FONT_SIZE, min_size=MIN_FONT_SIZE):
+def estimate_text_height(text, font_size, shape_width, line_spacing=1.2):
     """
-    Calcule la taille de police optimale pour plusieurs textes
-    en se basant sur le texte le plus long
+    Estime la hauteur du texte rendu en fonction de :
+    - Longueur du texte
+    - Taille de police
+    - Largeur du cadre (pour le word wrap)
+    - Interligne
     """
-    if not texts:
+    # Estimation du nombre de caractères par ligne selon la largeur et la taille de police
+    # Approximation : 1 caractère ≈ 0.6 * font_size en points
+    chars_per_inch = 72 / (font_size * 0.6)  # 72 points = 1 inch
+    shape_width_points = shape_width.inches * 72
+    chars_per_line = shape_width_points / (font_size * 0.6)
+    
+    # Calculer le nombre de lignes nécessaires
+    text_length = len(text)
+    
+    # Compter aussi les retours à la ligne explicites
+    explicit_lines = text.count('\n') + 1
+    
+    # Estimer les lignes dues au word wrap
+    wrapped_lines = math.ceil(text_length / chars_per_line)
+    
+    # Total de lignes
+    total_lines = max(explicit_lines, wrapped_lines)
+    
+    # Hauteur d'une ligne = font_size * line_spacing
+    line_height_points = font_size * line_spacing
+    
+    # Hauteur totale du texte
+    total_height_points = total_lines * line_height_points
+    total_height_inches = total_height_points / 72
+    
+    return total_height_inches, total_lines
+
+
+def find_optimal_font_size(texts_and_shapes, max_size=DEFAULT_FONT_SIZE, min_size=MIN_FONT_SIZE, line_spacing=1.2):
+    """
+    Trouve la taille de police optimale pour un groupe de shapes
+    en s'assurant que le texte tient dans chaque cadre
+    """
+    if not texts_and_shapes:
         return max_size
     
-    # Trouver la longueur maximale
-    max_length = max(len(text) for text in texts if text)
+    optimal_size = max_size
     
-    # Calculer la taille optimale selon la longueur
-    if max_length < 100:
-        font_size = max_size
-    elif max_length < 200:
-        font_size = max_size - 1
-    elif max_length < 300:
-        font_size = max_size - 2
-    elif max_length < 500:
-        font_size = max_size - 3
-    else:
-        font_size = min_size
+    # Pour chaque shape, trouver la taille max qui fait tenir le texte
+    for text, shape in texts_and_shapes:
+        if not text or not shape.has_text_frame:
+            continue
+        
+        shape_height = shape.height
+        shape_width = shape.width
+        
+        # Tester différentes tailles de police de max_size à min_size
+        for test_size in range(max_size, min_size - 1, -1):
+            estimated_height, num_lines = estimate_text_height(
+                text, test_size, shape_width, line_spacing
+            )
+            
+            # Ajouter une marge de sécurité (10% de la hauteur du cadre)
+            safety_margin = shape_height.inches * 0.1
+            available_height = shape_height.inches - safety_margin
+            
+            if estimated_height <= available_height:
+                # Cette taille convient pour cette shape
+                optimal_size = min(optimal_size, test_size)
+                print(f"  📐 Shape '{shape.name}': {len(text)} chars, {num_lines} lines → {test_size}pt fits in {shape_height.inches:.2f}\"")
+                break
+        else:
+            # Aucune taille ne convient, utiliser la taille minimale
+            optimal_size = min_size
+            print(f"  ⚠️ Shape '{shape.name}': Texte trop long, utilisation de la taille minimale {min_size}pt")
     
-    # S'assurer de ne pas descendre sous la taille minimale
-    font_size = max(font_size, min_size)
-    
-    print(f"📏 [FONT-CALC] Max length: {max_length} chars → Font size: {font_size}pt")
-    return font_size
+    return optimal_size
 
 
-def apply_font_size_to_shape(shape, text, font_size):
-    """Applique une taille de police à une shape"""
+def apply_text_with_formatting(shape, text, font_size, line_spacing=1.2):
+    """
+    Applique le texte avec formatage (police, interligne)
+    """
     if not shape.has_text_frame:
         return False
     
@@ -125,13 +175,16 @@ def apply_font_size_to_shape(shape, text, font_size):
     # Ajouter le texte
     p = text_frame.paragraphs[0]
     p.text = text
+    p.alignment = PP_PARAGRAPH_ALIGNMENT.LEFT
     
-    # Appliquer la taille de police à tous les runs
+    # Appliquer la taille de police et l'interligne
     for paragraph in text_frame.paragraphs:
+        paragraph.line_spacing = line_spacing
+        
         for run in paragraph.runs:
             run.font.size = Pt(font_size)
     
-    print(f"✍️  [APPLY-FONT] Shape '{shape.name}': {len(text)} chars → {font_size}pt")
+    print(f"  ✍️  Shape '{shape.name}': {len(text)} chars → {font_size}pt, interligne {line_spacing}")
     return True
 
 
@@ -155,13 +208,15 @@ def analyze_presentation(prs):
                 "name": shape.name,
                 "type": str(shape.shape_type),
                 "has_text_frame": shape.has_text_frame,
-                "is_uniform_format": is_uniform_format_shape(shape)
+                "group": get_shape_group(shape)
             }
             
             if shape.has_text_frame:
                 text = shape.text_frame.text
                 shape_info["text"] = text
                 shape_info["text_length"] = len(text)
+                shape_info["width_inches"] = shape.width.inches
+                shape_info["height_inches"] = shape.height.inches
                 
                 if shape.is_placeholder:
                     shape_info["placeholder_type"] = str(shape.placeholder_format.type)
@@ -182,12 +237,14 @@ def analyze_presentation(prs):
 
 def modify_presentation(prs, modifications):
     """
-    Modifie la présentation avec ajustement intelligent de la police
+    Modifie la présentation avec ajustement intelligent de la police en 2 groupes
     """
     warnings = []
     
-    # Phase 1 : Identifier les shapes uniformes et leurs textes
-    uniform_shapes_data = []
+    # Phase 1 : Collecter les shapes par groupe
+    group_1_data = []
+    group_2_data = []
+    other_shapes_data = []
     
     for slide_key, shape_mods in modifications.items():
         slide_num = int(slide_key.split('_')[1])
@@ -204,61 +261,53 @@ def modify_presentation(prs, modifications):
                 continue
             
             shape = slide.shapes[shape_num]
+            group = get_shape_group(shape)
             
-            if is_uniform_format_shape(shape):
-                uniform_shapes_data.append({
-                    'shape': shape,
-                    'text': new_text,
-                    'slide_num': slide_num,
-                    'shape_num': shape_num
-                })
+            if group == 1:
+                group_1_data.append((new_text, shape))
+            elif group == 2:
+                group_2_data.append((new_text, shape))
+            else:
+                other_shapes_data.append((new_text, shape))
     
-    # Phase 2 : Calculer la taille de police optimale pour les shapes uniformes
-    uniform_font_size = DEFAULT_FONT_SIZE
-    if uniform_shapes_data:
-        uniform_texts = [data['text'] for data in uniform_shapes_data]
-        uniform_font_size = calculate_optimal_font_size(uniform_texts)
+    # Phase 2 : Calculer les tailles optimales pour chaque groupe
+    print(f"\n🎯 [GROUP 1] {len(group_1_data)} shapes (Contexte, Résultats, Travaux)")
+    group_1_font_size = DEFAULT_FONT_SIZE
+    if group_1_data:
+        group_1_font_size = find_optimal_font_size(group_1_data, max_size=MAX_FONT_SIZE, min_size=MIN_FONT_SIZE, line_spacing=LINE_SPACING)
+        print(f"  → Taille finale Groupe 1 : {group_1_font_size}pt\n")
         
-        print(f"🎯 [UNIFORM] {len(uniform_shapes_data)} shapes with uniform font: {uniform_font_size}pt")
-        
-        # Vérifier si on est à la taille minimale
-        if uniform_font_size == MIN_FONT_SIZE:
-            max_length = max(len(text) for text in uniform_texts)
+        if group_1_font_size == MIN_FONT_SIZE:
             warnings.append(
-                f"⚠️ ATTENTION : Un ou plusieurs cadres (Contexte, Travaux, etc.) "
-                f"contiennent beaucoup de texte ({max_length} caractères max). "
+                f"⚠️ GROUPE 1 (Contexte, Résultats, Travaux) : Le texte est dense. "
                 f"La police a été réduite au minimum ({MIN_FONT_SIZE}pt). "
-                f"Pour une meilleure lisibilité, réduisez le contenu à ~300-400 caractères."
+                f"Pour améliorer la lisibilité, réduisez le contenu."
+            )
+    
+    print(f"🎯 [GROUP 2] {len(group_2_data)} shapes (Type de mission, Outils)")
+    group_2_font_size = DEFAULT_FONT_SIZE
+    if group_2_data:
+        group_2_font_size = find_optimal_font_size(group_2_data, max_size=MAX_FONT_SIZE, min_size=MIN_FONT_SIZE, line_spacing=LINE_SPACING)
+        print(f"  → Taille finale Groupe 2 : {group_2_font_size}pt\n")
+        
+        if group_2_font_size == MIN_FONT_SIZE:
+            warnings.append(
+                f"⚠️ GROUPE 2 (Type de mission, Outils) : Le texte est dense. "
+                f"La police a été réduite au minimum ({MIN_FONT_SIZE}pt). "
+                f"Pour améliorer la lisibilité, réduisez le contenu."
             )
     
     # Phase 3 : Appliquer les modifications
-    for slide_key, shape_mods in modifications.items():
-        slide_num = int(slide_key.split('_')[1])
-        
-        if slide_num >= len(prs.slides):
-            continue
-        
-        slide = prs.slides[slide_num]
-        
-        for shape_key, new_text in shape_mods.items():
-            shape_num = int(shape_key.split('_')[1])
-            
-            if shape_num >= len(slide.shapes):
-                continue
-            
-            shape = slide.shapes[shape_num]
-            
-            if not shape.has_text_frame:
-                continue
-            
-            # Appliquer la taille de police appropriée
-            if is_uniform_format_shape(shape):
-                # Shapes uniformes : même taille pour toutes
-                apply_font_size_to_shape(shape, new_text, uniform_font_size)
-            else:
-                # Autres shapes : calcul individuel
-                individual_font_size = calculate_optimal_font_size([new_text])
-                apply_font_size_to_shape(shape, new_text, individual_font_size)
+    for text, shape in group_1_data:
+        apply_text_with_formatting(shape, text, group_1_font_size, LINE_SPACING)
+    
+    for text, shape in group_2_data:
+        apply_text_with_formatting(shape, text, group_2_font_size, LINE_SPACING)
+    
+    for text, shape in other_shapes_data:
+        # Pour les autres shapes, calcul individuel
+        individual_size = find_optimal_font_size([(text, shape)], max_size=MAX_FONT_SIZE, min_size=MIN_FONT_SIZE, line_spacing=1.0)
+        apply_text_with_formatting(shape, text, individual_size, 1.0)
     
     return prs, warnings
 
@@ -285,7 +334,7 @@ def handle_mcp_request(body, request_id):
                 },
                 "serverInfo": {
                     "name": "pptx-mcp-server",
-                    "version": "2.0.0"
+                    "version": "2.1.0"
                 }
             }
         }
@@ -299,7 +348,7 @@ def handle_mcp_request(body, request_id):
                 "tools": [
                     {
                         "name": "analyze_template",
-                        "description": "Analyse la structure d'un template PowerPoint (slides, zones de texte, images)",
+                        "description": "Analyse la structure d'un template PowerPoint (slides, zones de texte, dimensions des cadres)",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -313,7 +362,7 @@ def handle_mcp_request(body, request_id):
                     },
                     {
                         "name": "modify_template",
-                        "description": "Modifie un template PowerPoint avec ajustement automatique de la police pour éviter les débordements",
+                        "description": "Modifie un template PowerPoint avec ajustement intelligent de la police en 2 groupes indépendants et interligne optimisé",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -479,25 +528,28 @@ def mcp_endpoint():
     if request.method == 'GET':
         return jsonify({
             "name": "PPTX MCP Server",
-            "version": "2.0.0",
+            "version": "2.1.0",
             "tools": ["analyze_template", "modify_template"],
-            "features": ["intelligent_font_sizing", "uniform_format_shapes"]
+            "features": [
+                "dual_group_font_sizing",
+                "intelligent_height_calculation",
+                "line_spacing_optimization"
+            ],
+            "groups": {
+                "group_1": GROUP_1_SHAPES,
+                "group_2": GROUP_2_SHAPES
+            }
         })
     
     # Handle POST - check if client wants SSE
     accept_header = request.headers.get('Accept', '')
     wants_sse = 'text/event-stream' in accept_header
     
-    print(f"📥 Accept header: {accept_header}")
-    print(f"📥 Wants SSE: {wants_sse}")
-    
     body = request.get_json() or {}
     request_id = body.get('id', 1)
     
     # If SSE is requested, use SSE transport
     if wants_sse:
-        print("🔄 Using SSE transport")
-        
         def generate_sse():
             response_data = handle_mcp_request(body, request_id)
             sse_data = f"data: {json.dumps(response_data)}\n\n"
@@ -515,7 +567,6 @@ def mcp_endpoint():
         )
     
     # Otherwise use standard JSON response
-    print("📤 Using JSON transport")
     response_data = handle_mcp_request(body, request_id)
     return jsonify(response_data)
 
@@ -547,13 +598,16 @@ def health():
     return jsonify({
         "status": "healthy",
         "server": "pptx-mcp-server",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "transport": "JSON + SSE",
         "features": {
-            "intelligent_font_sizing": True,
-            "uniform_format_shapes": UNIFORM_FORMAT_SHAPES,
+            "dual_group_sizing": True,
+            "intelligent_height_calc": True,
+            "line_spacing": LINE_SPACING,
+            "group_1": GROUP_1_SHAPES,
+            "group_2": GROUP_2_SHAPES,
             "min_font_size": MIN_FONT_SIZE,
-            "default_font_size": DEFAULT_FONT_SIZE
+            "max_font_size": MAX_FONT_SIZE
         }
     })
 
