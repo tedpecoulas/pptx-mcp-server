@@ -1,7 +1,7 @@
 """
 Claude Skills MCP Server - PPTX Edition with SSE Support
 Python server for reading and modifying PowerPoint templates
-WITH INTELLIGENT FONT AUTO-SIZING v2.2 - Fixed bullets + Contexte en phrases
+WITH INTELLIGENT FONT AUTO-SIZING v2.3 - Fix double bullets + Contexte paragraphes
 """
 
 from flask import Flask, request, jsonify, send_file, Response
@@ -10,6 +10,7 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.util import Pt, Inches
 from pptx.enum.text import MSO_AUTO_SIZE, PP_PARAGRAPH_ALIGNMENT
+from pptx.enum.dml import MSO_THEME_COLOR
 import requests
 import io
 import json
@@ -108,9 +109,13 @@ def estimate_text_height(text, font_size, shape_width, line_spacing=1.2):
     """
     Estime la hauteur du texte rendu
     """
-    chars_per_inch = 72 / (font_size * 0.6)
+    # Estimation plus précise
+    chars_per_inch = 72 / (font_size * 0.5)  # Ajusté pour être plus précis
     shape_width_points = shape_width.inches * 72
-    chars_per_line = shape_width_points / (font_size * 0.6)
+    
+    # Réduire la largeur effective pour tenir compte des marges
+    effective_width = shape_width_points * 0.9  # 10% de marge
+    chars_per_line = effective_width / (font_size * 0.5)
     
     text_length = len(text)
     explicit_lines = text.count('\n') + 1
@@ -145,7 +150,8 @@ def find_optimal_font_size(texts_and_shapes, max_size=DEFAULT_FONT_SIZE, min_siz
                 text, test_size, shape_width, line_spacing
             )
             
-            safety_margin = shape_height.inches * 0.1
+            # Marge de sécurité augmentée à 15%
+            safety_margin = shape_height.inches * 0.15
             available_height = shape_height.inches - safety_margin
             
             if estimated_height <= available_height:
@@ -159,66 +165,74 @@ def find_optimal_font_size(texts_and_shapes, max_size=DEFAULT_FONT_SIZE, min_siz
     return optimal_size
 
 
-def format_bullet_points(text):
+def clean_bullet_text(text):
     """
-    Formate les bullet points en s'assurant qu'ils sont bien formés
-    N'ajoute PAS de bullets si le texte n'en a pas déjà
+    Nettoie le texte en enlevant les bullets du texte lui-même
+    car PowerPoint les ajoutera automatiquement
     """
     if not text:
         return text
     
-    # Si le texte contient déjà des bullets, les normaliser
-    if '•' in text or text.strip().startswith('-'):
-        lines = text.split('\n')
-        formatted_lines = []
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            
-            # Normaliser les différents formats de bullets
-            if line.startswith('-'):
-                line = '• ' + line[1:].strip()
-            elif line.startswith('•'):
-                # S'assurer qu'il y a un espace après le bullet
-                if len(line) > 1 and line[1] != ' ':
-                    line = '• ' + line[1:].strip()
-            # Si la ligne ne commence pas par un bullet mais qu'on est dans un contexte de bullets,
-            # on suppose que c'est une continuation (ne pas ajouter de bullet)
-            
-            formatted_lines.append(line)
-        
-        return '\n'.join(formatted_lines)
+    lines = text.split('\n')
+    cleaned_lines = []
     
-    # Si pas de bullets, retourner le texte tel quel
-    return text
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Enlever les bullets du texte (•, -, *)
+        if line.startswith('• '):
+            line = line[2:]
+        elif line.startswith('•'):
+            line = line[1:].strip()
+        elif line.startswith('- '):
+            line = line[2:]
+        elif line.startswith('-'):
+            line = line[1:].strip()
+        elif line.startswith('* '):
+            line = line[2:]
+        elif line.startswith('*'):
+            line = line[1:].strip()
+        
+        cleaned_lines.append(line)
+    
+    return '\n'.join(cleaned_lines)
 
 
-def apply_text_with_formatting(shape, text, font_size, line_spacing=1.2, force_bullets=True):
+def apply_text_with_formatting(shape, text, font_size, line_spacing=1.2, use_bullets=True):
     """
     Applique le texte avec formatage optimisé
-    force_bullets=False pour les shapes comme "Contexte" qui doivent être en paragraphes
+    use_bullets=False pour les shapes comme "Contexte" qui doivent être en paragraphes
     """
     if not shape.has_text_frame:
         return False
     
-    # Déterminer si on doit forcer les bullets
-    use_bullets = force_bullets and should_have_bullets(shape)
+    # Déterminer si on doit utiliser les bullets
+    should_use_bullets = use_bullets and should_have_bullets(shape)
     
-    # Formater les bullet points uniquement si nécessaire
-    if use_bullets:
-        text = format_bullet_points(text)
+    # Nettoyer le texte des bullets existants
+    # PowerPoint les ajoutera automatiquement si on active les bullets
+    cleaned_text = clean_bullet_text(text) if should_use_bullets else text
     
     text_frame = shape.text_frame
     text_frame.clear()
     text_frame.word_wrap = True
     text_frame.auto_size = MSO_AUTO_SIZE.NONE
     
+    # Réduire les marges internes pour maximiser l'espace
+    text_frame.margin_bottom = Inches(0.05)
+    text_frame.margin_top = Inches(0.05)
+    text_frame.margin_left = Inches(0.1)
+    text_frame.margin_right = Inches(0.1)
+    
     # Séparer les lignes
-    lines = text.split('\n')
+    lines = cleaned_text.split('\n')
     
     for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+            
         if i == 0:
             p = text_frame.paragraphs[0]
         else:
@@ -227,19 +241,30 @@ def apply_text_with_formatting(shape, text, font_size, line_spacing=1.2, force_b
         p.text = line
         p.alignment = PP_PARAGRAPH_ALIGNMENT.LEFT
         p.line_spacing = line_spacing
+        p.level = 0
         
-        # Espacement entre les bullets (seulement si c'est un bullet)
-        if use_bullets and line.strip().startswith('•'):
-            p.space_before = Pt(3)
-            p.space_after = Pt(1)
-        elif not use_bullets:
-            # Pour les paragraphes (comme Contexte), petit espacement entre les phrases
-            p.space_after = Pt(6)
+        # IMPORTANT : Activer/désactiver les bullets via PowerPoint
+        if should_use_bullets:
+            # PowerPoint ajoutera automatiquement les bullets
+            # On laisse le format par défaut qui inclut les bullets
+            p.space_before = Pt(2)
+            p.space_after = Pt(2)
+        else:
+            # Pour les paragraphes (comme Contexte), pas de bullets
+            # On doit explicitement désactiver les bullets
+            try:
+                # Essayer de désactiver les bullets
+                p.font.size = Pt(font_size)
+            except:
+                pass
+            p.space_before = Pt(0)
+            p.space_after = Pt(4)
         
+        # Appliquer la taille de police
         for run in p.runs:
             run.font.size = Pt(font_size)
     
-    bullet_status = "bullets" if use_bullets else "paragraphes"
+    bullet_status = "bullets" if should_use_bullets else "paragraphes"
     print(f"  ✍️  Shape '{shape.name}': {len(text)} chars, {len(lines)} lines → {font_size}pt ({bullet_status})")
     return True
 
@@ -272,8 +297,8 @@ def analyze_presentation(prs):
                 text = shape.text_frame.text
                 shape_info["text"] = text
                 shape_info["text_length"] = len(text)
-                shape_info["width_inches"] = shape.width.inches
-                shape_info["height_inches"] = shape.height.inches
+                shape_info["width_inches"] = round(shape.width.inches, 2)
+                shape_info["height_inches"] = round(shape.height.inches, 2)
                 
                 if shape.is_placeholder:
                     shape_info["placeholder_type"] = str(shape.placeholder_format.type)
@@ -354,16 +379,15 @@ def modify_presentation(prs, modifications):
     
     # Phase 3 : Appliquer les modifications
     for text, shape in group_1_data:
-        # Le Contexte ne doit pas avoir de bullets
         use_bullets = should_have_bullets(shape)
-        apply_text_with_formatting(shape, text, group_1_font_size, LINE_SPACING, force_bullets=use_bullets)
+        apply_text_with_formatting(shape, text, group_1_font_size, LINE_SPACING, use_bullets=use_bullets)
     
     for text, shape in group_2_data:
-        apply_text_with_formatting(shape, text, group_2_font_size, LINE_SPACING, force_bullets=True)
+        apply_text_with_formatting(shape, text, group_2_font_size, LINE_SPACING, use_bullets=True)
     
     for text, shape in other_shapes_data:
         individual_size = find_optimal_font_size([(text, shape)], max_size=MAX_FONT_SIZE, min_size=MIN_FONT_SIZE, line_spacing=1.0)
-        apply_text_with_formatting(shape, text, individual_size, 1.0, force_bullets=True)
+        apply_text_with_formatting(shape, text, individual_size, 1.0, use_bullets=True)
     
     return prs, warnings
 
@@ -390,7 +414,7 @@ def handle_mcp_request(body, request_id):
                 },
                 "serverInfo": {
                     "name": "pptx-mcp-server",
-                    "version": "2.2.0"
+                    "version": "2.3.0"
                 }
             }
         }
@@ -418,7 +442,7 @@ def handle_mcp_request(body, request_id):
                     },
                     {
                         "name": "modify_template",
-                        "description": "Modifie un template PowerPoint avec formatage intelligent (bullets pour certaines zones, paragraphes pour Contexte)",
+                        "description": "Modifie un template PowerPoint avec formatage intelligent",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -428,7 +452,7 @@ def handle_mcp_request(body, request_id):
                                 },
                                 "modifications": {
                                     "type": "object",
-                                    "description": "Dictionnaire des modifications (slide_X: {shape_Y: nouveau_texte})"
+                                    "description": "Dictionnaire des modifications"
                                 },
                                 "metadata": {
                                     "type": "object",
@@ -452,7 +476,6 @@ def handle_mcp_request(body, request_id):
         tool_name = params.get('name')
         args = params.get('arguments', {})
         
-        # Tool: analyze_template
         if tool_name == 'analyze_template':
             try:
                 template_url = args.get('template_url')
@@ -481,7 +504,6 @@ def handle_mcp_request(body, request_id):
                     }
                 }
         
-        # Tool: modify_template
         if tool_name == 'modify_template':
             try:
                 template_url = args.get('template_url')
@@ -494,7 +516,6 @@ def handle_mcp_request(body, request_id):
                 prs = download_pptx(template_url)
                 prs, warnings = modify_presentation(prs, modifications)
                 
-                # Generate filename
                 client = sanitize_filename(metadata.get('client', ''))
                 mission = sanitize_filename(metadata.get('mission', ''))
                 consultant = sanitize_filename(metadata.get('consultant', ''))
@@ -511,7 +532,6 @@ def handle_mcp_request(body, request_id):
                 else:
                     suggested_name = f"REX_{timestamp}.pptx"
                 
-                # Save file
                 output_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pptx')
                 prs.save(output_file.name)
                 
@@ -520,7 +540,6 @@ def handle_mcp_request(body, request_id):
                     'suggested_name': suggested_name
                 }
                 
-                # Construct URL
                 base_url = os.environ.get('SERVER_URL', 'https://pptx-mcp-server-production.up.railway.app')
                 download_url = f"{base_url}/download/{file_id}"
                 
@@ -581,13 +600,8 @@ def mcp_endpoint():
     if request.method == 'GET':
         return jsonify({
             "name": "PPTX MCP Server",
-            "version": "2.2.0",
-            "tools": ["analyze_template", "modify_template"],
-            "features": [
-                "dual_group_font_sizing",
-                "contexte_en_paragraphes",
-                "bullet_point_formatting"
-            ]
+            "version": "2.3.0",
+            "tools": ["analyze_template", "modify_template"]
         })
     
     accept_header = request.headers.get('Accept', '')
@@ -644,12 +658,7 @@ def health():
     return jsonify({
         "status": "healthy",
         "server": "pptx-mcp-server",
-        "version": "2.2.0",
-        "features": {
-            "contexte_paragraphes": True,
-            "bullets_autres_zones": True,
-            "no_bullet_shapes": NO_BULLET_SHAPES
-        }
+        "version": "2.3.0"
     })
 
 
