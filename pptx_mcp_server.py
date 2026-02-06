@@ -1,7 +1,7 @@
 """
 Claude Skills MCP Server - PPTX Edition with SSE Support
 Python server for reading and modifying PowerPoint templates
-WITH INTELLIGENT FONT AUTO-SIZING v2.1 - Dual Group + Bullet Points
+WITH INTELLIGENT FONT AUTO-SIZING v2.2 - Fixed bullets + Contexte en phrases
 """
 
 from flask import Flask, request, jsonify, send_file, Response
@@ -30,12 +30,15 @@ temp_files = {}
 GROUP_1_SHAPES = ["contexte", "résultats", "travaux réalisés"]
 GROUP_2_SHAPES = ["type de mission", "outils utilisés"]
 
+# Shapes qui ne doivent PAS avoir de bullets (texte en paragraphes)
+NO_BULLET_SHAPES = ["contexte"]
+
 # Taille de police par défaut et minimale
 DEFAULT_FONT_SIZE = 12
 MIN_FONT_SIZE = 8
 MAX_FONT_SIZE = 14
 
-# Interligne pour esthétique (1.0 = simple, 1.5 = un demi, 2.0 = double)
+# Interligne pour esthétique
 LINE_SPACING = 1.2
 
 
@@ -83,35 +86,38 @@ def get_shape_group(shape):
     return None
 
 
+def should_have_bullets(shape):
+    """
+    Détermine si une shape doit avoir des bullet points
+    """
+    if not shape.has_text_frame:
+        return False
+    
+    shape_name_normalized = normalize_shape_name(shape.name)
+    shape_text_normalized = normalize_shape_name(shape.text_frame.text) if shape.text_frame.text else ""
+    
+    # Vérifier si c'est une shape "no bullets"
+    for keyword in NO_BULLET_SHAPES:
+        if keyword.lower() in shape_name_normalized or keyword.lower() in shape_text_normalized:
+            return False
+    
+    return True
+
+
 def estimate_text_height(text, font_size, shape_width, line_spacing=1.2):
     """
-    Estime la hauteur du texte rendu en fonction de :
-    - Longueur du texte
-    - Taille de police
-    - Largeur du cadre (pour le word wrap)
-    - Interligne
+    Estime la hauteur du texte rendu
     """
-    # Estimation du nombre de caractères par ligne selon la largeur et la taille de police
     chars_per_inch = 72 / (font_size * 0.6)
     shape_width_points = shape_width.inches * 72
     chars_per_line = shape_width_points / (font_size * 0.6)
     
-    # Calculer le nombre de lignes nécessaires
     text_length = len(text)
-    
-    # Compter aussi les retours à la ligne explicites
     explicit_lines = text.count('\n') + 1
-    
-    # Estimer les lignes dues au word wrap
     wrapped_lines = math.ceil(text_length / chars_per_line)
-    
-    # Total de lignes
     total_lines = max(explicit_lines, wrapped_lines)
     
-    # Hauteur d'une ligne = font_size * line_spacing
     line_height_points = font_size * line_spacing
-    
-    # Hauteur totale du texte
     total_height_points = total_lines * line_height_points
     total_height_inches = total_height_points / 72
     
@@ -121,14 +127,12 @@ def estimate_text_height(text, font_size, shape_width, line_spacing=1.2):
 def find_optimal_font_size(texts_and_shapes, max_size=DEFAULT_FONT_SIZE, min_size=MIN_FONT_SIZE, line_spacing=1.2):
     """
     Trouve la taille de police optimale pour un groupe de shapes
-    en s'assurant que le texte tient dans chaque cadre
     """
     if not texts_and_shapes:
         return max_size
     
     optimal_size = max_size
     
-    # Pour chaque shape, trouver la taille max qui fait tenir le texte
     for text, shape in texts_and_shapes:
         if not text or not shape.has_text_frame:
             continue
@@ -136,37 +140,34 @@ def find_optimal_font_size(texts_and_shapes, max_size=DEFAULT_FONT_SIZE, min_siz
         shape_height = shape.height
         shape_width = shape.width
         
-        # Tester différentes tailles de police de max_size à min_size
         for test_size in range(max_size, min_size - 1, -1):
             estimated_height, num_lines = estimate_text_height(
                 text, test_size, shape_width, line_spacing
             )
             
-            # Ajouter une marge de sécurité (10% de la hauteur du cadre)
             safety_margin = shape_height.inches * 0.1
             available_height = shape_height.inches - safety_margin
             
             if estimated_height <= available_height:
-                # Cette taille convient pour cette shape
                 optimal_size = min(optimal_size, test_size)
                 print(f"  📐 Shape '{shape.name}': {len(text)} chars, {num_lines} lines → {test_size}pt fits in {shape_height.inches:.2f}\"")
                 break
         else:
-            # Aucune taille ne convient, utiliser la taille minimale
             optimal_size = min_size
-            print(f"  ⚠️ Shape '{shape.name}': Texte trop long, utilisation de la taille minimale {min_size}pt")
+            print(f"  ⚠️ Shape '{shape.name}': Texte trop long, taille minimale {min_size}pt")
     
     return optimal_size
 
 
 def format_bullet_points(text):
     """
-    Améliore le formatage des bullet points pour un meilleur rendu visuel
+    Formate les bullet points en s'assurant qu'ils sont bien formés
+    N'ajoute PAS de bullets si le texte n'en a pas déjà
     """
     if not text:
         return text
     
-    # Si le texte contient des bullets
+    # Si le texte contient déjà des bullets, les normaliser
     if '•' in text or text.strip().startswith('-'):
         lines = text.split('\n')
         formatted_lines = []
@@ -176,31 +177,38 @@ def format_bullet_points(text):
             if not line:
                 continue
             
-            # Normaliser les bullets
+            # Normaliser les différents formats de bullets
             if line.startswith('-'):
                 line = '• ' + line[1:].strip()
-            elif line.startswith('•') and len(line) > 1 and line[1] != ' ':
-                line = '• ' + line[1:].strip()
-            elif not line.startswith('•'):
-                # Si pas de bullet, en ajouter un
-                line = '• ' + line
+            elif line.startswith('•'):
+                # S'assurer qu'il y a un espace après le bullet
+                if len(line) > 1 and line[1] != ' ':
+                    line = '• ' + line[1:].strip()
+            # Si la ligne ne commence pas par un bullet mais qu'on est dans un contexte de bullets,
+            # on suppose que c'est une continuation (ne pas ajouter de bullet)
             
             formatted_lines.append(line)
         
         return '\n'.join(formatted_lines)
     
+    # Si pas de bullets, retourner le texte tel quel
     return text
 
 
-def apply_text_with_formatting(shape, text, font_size, line_spacing=1.2):
+def apply_text_with_formatting(shape, text, font_size, line_spacing=1.2, force_bullets=True):
     """
-    Applique le texte avec formatage optimisé (police, interligne, bullets)
+    Applique le texte avec formatage optimisé
+    force_bullets=False pour les shapes comme "Contexte" qui doivent être en paragraphes
     """
     if not shape.has_text_frame:
         return False
     
-    # Améliorer le formatage des bullet points
-    text = format_bullet_points(text)
+    # Déterminer si on doit forcer les bullets
+    use_bullets = force_bullets and should_have_bullets(shape)
+    
+    # Formater les bullet points uniquement si nécessaire
+    if use_bullets:
+        text = format_bullet_points(text)
     
     text_frame = shape.text_frame
     text_frame.clear()
@@ -220,15 +228,19 @@ def apply_text_with_formatting(shape, text, font_size, line_spacing=1.2):
         p.alignment = PP_PARAGRAPH_ALIGNMENT.LEFT
         p.line_spacing = line_spacing
         
-        # Espacement léger entre les bullets pour l'esthétique
-        if line.strip().startswith('•'):
+        # Espacement entre les bullets (seulement si c'est un bullet)
+        if use_bullets and line.strip().startswith('•'):
             p.space_before = Pt(3)
             p.space_after = Pt(1)
+        elif not use_bullets:
+            # Pour les paragraphes (comme Contexte), petit espacement entre les phrases
+            p.space_after = Pt(6)
         
         for run in p.runs:
             run.font.size = Pt(font_size)
     
-    print(f"  ✍️  Shape '{shape.name}': {len(text)} chars, {len(lines)} lines → {font_size}pt")
+    bullet_status = "bullets" if use_bullets else "paragraphes"
+    print(f"  ✍️  Shape '{shape.name}': {len(text)} chars, {len(lines)} lines → {font_size}pt ({bullet_status})")
     return True
 
 
@@ -252,7 +264,8 @@ def analyze_presentation(prs):
                 "name": shape.name,
                 "type": str(shape.shape_type),
                 "has_text_frame": shape.has_text_frame,
-                "group": get_shape_group(shape)
+                "group": get_shape_group(shape),
+                "should_have_bullets": should_have_bullets(shape)
             }
             
             if shape.has_text_frame:
@@ -281,7 +294,7 @@ def analyze_presentation(prs):
 
 def modify_presentation(prs, modifications):
     """
-    Modifie la présentation avec ajustement intelligent de la police en 2 groupes
+    Modifie la présentation avec ajustement intelligent
     """
     warnings = []
     
@@ -314,7 +327,7 @@ def modify_presentation(prs, modifications):
             else:
                 other_shapes_data.append((new_text, shape))
     
-    # Phase 2 : Calculer les tailles optimales pour chaque groupe
+    # Phase 2 : Calculer les tailles optimales
     print(f"\n🎯 [GROUP 1] {len(group_1_data)} shapes (Contexte, Résultats, Travaux)")
     group_1_font_size = DEFAULT_FONT_SIZE
     if group_1_data:
@@ -324,8 +337,7 @@ def modify_presentation(prs, modifications):
         if group_1_font_size == MIN_FONT_SIZE:
             warnings.append(
                 f"⚠️ GROUPE 1 (Contexte, Résultats, Travaux) : Le texte est dense. "
-                f"La police a été réduite au minimum ({MIN_FONT_SIZE}pt). "
-                f"Pour améliorer la lisibilité, réduisez le contenu."
+                f"La police a été réduite au minimum ({MIN_FONT_SIZE}pt)."
             )
     
     print(f"🎯 [GROUP 2] {len(group_2_data)} shapes (Type de mission, Outils)")
@@ -337,21 +349,21 @@ def modify_presentation(prs, modifications):
         if group_2_font_size == MIN_FONT_SIZE:
             warnings.append(
                 f"⚠️ GROUPE 2 (Type de mission, Outils) : Le texte est dense. "
-                f"La police a été réduite au minimum ({MIN_FONT_SIZE}pt). "
-                f"Pour améliorer la lisibilité, réduisez le contenu."
+                f"La police a été réduite au minimum ({MIN_FONT_SIZE}pt)."
             )
     
     # Phase 3 : Appliquer les modifications
     for text, shape in group_1_data:
-        apply_text_with_formatting(shape, text, group_1_font_size, LINE_SPACING)
+        # Le Contexte ne doit pas avoir de bullets
+        use_bullets = should_have_bullets(shape)
+        apply_text_with_formatting(shape, text, group_1_font_size, LINE_SPACING, force_bullets=use_bullets)
     
     for text, shape in group_2_data:
-        apply_text_with_formatting(shape, text, group_2_font_size, LINE_SPACING)
+        apply_text_with_formatting(shape, text, group_2_font_size, LINE_SPACING, force_bullets=True)
     
     for text, shape in other_shapes_data:
-        # Pour les autres shapes, calcul individuel
         individual_size = find_optimal_font_size([(text, shape)], max_size=MAX_FONT_SIZE, min_size=MIN_FONT_SIZE, line_spacing=1.0)
-        apply_text_with_formatting(shape, text, individual_size, 1.0)
+        apply_text_with_formatting(shape, text, individual_size, 1.0, force_bullets=True)
     
     return prs, warnings
 
@@ -378,7 +390,7 @@ def handle_mcp_request(body, request_id):
                 },
                 "serverInfo": {
                     "name": "pptx-mcp-server",
-                    "version": "2.1.0"
+                    "version": "2.2.0"
                 }
             }
         }
@@ -392,7 +404,7 @@ def handle_mcp_request(body, request_id):
                 "tools": [
                     {
                         "name": "analyze_template",
-                        "description": "Analyse la structure d'un template PowerPoint (slides, zones de texte, dimensions des cadres)",
+                        "description": "Analyse la structure d'un template PowerPoint",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -406,7 +418,7 @@ def handle_mcp_request(body, request_id):
                     },
                     {
                         "name": "modify_template",
-                        "description": "Modifie un template PowerPoint avec ajustement intelligent de la police en 2 groupes indépendants, interligne optimisé et formatage des bullet points",
+                        "description": "Modifie un template PowerPoint avec formatage intelligent (bullets pour certaines zones, paragraphes pour Contexte)",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -420,7 +432,7 @@ def handle_mcp_request(body, request_id):
                                 },
                                 "metadata": {
                                     "type": "object",
-                                    "description": "Métadonnées pour nommer le fichier (client, mission, consultant)",
+                                    "description": "Métadonnées pour nommer le fichier",
                                     "properties": {
                                         "client": {"type": "string"},
                                         "mission": {"type": "string"},
@@ -482,7 +494,7 @@ def handle_mcp_request(body, request_id):
                 prs = download_pptx(template_url)
                 prs, warnings = modify_presentation(prs, modifications)
                 
-                # Generate filename from metadata
+                # Generate filename
                 client = sanitize_filename(metadata.get('client', ''))
                 mission = sanitize_filename(metadata.get('mission', ''))
                 consultant = sanitize_filename(metadata.get('consultant', ''))
@@ -490,7 +502,6 @@ def handle_mcp_request(body, request_id):
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 file_id = f"pptx_{timestamp}"
                 
-                # Build suggested filename
                 if client and mission and consultant:
                     suggested_name = f"REX - {client} - {mission} - {consultant}.pptx"
                 elif client and mission:
@@ -509,14 +520,12 @@ def handle_mcp_request(body, request_id):
                     'suggested_name': suggested_name
                 }
                 
-                # Construct full URL
+                # Construct URL
                 base_url = os.environ.get('SERVER_URL', 'https://pptx-mcp-server-production.up.railway.app')
                 download_url = f"{base_url}/download/{file_id}"
                 
-                # Construire le message de réponse
                 response_text = f"✅ Votre REX est prêt !\n\n📥 Télécharger ici: {download_url}\n\n💡 Nom de fichier: {suggested_name}\n\n"
                 
-                # Ajouter les warnings si présents
                 if warnings:
                     response_text += "\n" + "\n\n".join(warnings)
                 
@@ -543,7 +552,6 @@ def handle_mcp_request(body, request_id):
                     }
                 }
         
-        # Unknown tool
         return {
             "jsonrpc": "2.0",
             "id": request_id,
@@ -553,7 +561,6 @@ def handle_mcp_request(body, request_id):
             }
         }
     
-    # Unknown method
     return {
         "jsonrpc": "2.0",
         "id": request_id,
@@ -566,7 +573,7 @@ def handle_mcp_request(body, request_id):
 
 @app.route('/api/mcp', methods=['GET', 'POST', 'OPTIONS'])
 def mcp_endpoint():
-    """Main MCP endpoint - supports both JSON and SSE transports"""
+    """Main MCP endpoint"""
     
     if request.method == 'OPTIONS':
         return '', 200
@@ -574,28 +581,21 @@ def mcp_endpoint():
     if request.method == 'GET':
         return jsonify({
             "name": "PPTX MCP Server",
-            "version": "2.1.0",
+            "version": "2.2.0",
             "tools": ["analyze_template", "modify_template"],
             "features": [
                 "dual_group_font_sizing",
-                "intelligent_height_calculation",
-                "line_spacing_optimization",
+                "contexte_en_paragraphes",
                 "bullet_point_formatting"
-            ],
-            "groups": {
-                "group_1": GROUP_1_SHAPES,
-                "group_2": GROUP_2_SHAPES
-            }
+            ]
         })
     
-    # Handle POST - check if client wants SSE
     accept_header = request.headers.get('Accept', '')
     wants_sse = 'text/event-stream' in accept_header
     
     body = request.get_json() or {}
     request_id = body.get('id', 1)
     
-    # If SSE is requested, use SSE transport
     if wants_sse:
         def generate_sse():
             response_data = handle_mcp_request(body, request_id)
@@ -613,14 +613,13 @@ def mcp_endpoint():
             }
         )
     
-    # Otherwise use standard JSON response
     response_data = handle_mcp_request(body, request_id)
     return jsonify(response_data)
 
 
 @app.route('/download/<file_id>')
 def download_file(file_id):
-    """Download endpoint for modified presentations"""
+    """Download endpoint"""
     if file_id not in temp_files:
         return jsonify({"error": "File not found"}), 404
     
@@ -641,21 +640,15 @@ def download_file(file_id):
 
 @app.route('/health')
 def health():
-    """Health check endpoint"""
+    """Health check"""
     return jsonify({
         "status": "healthy",
         "server": "pptx-mcp-server",
-        "version": "2.1.0",
-        "transport": "JSON + SSE",
+        "version": "2.2.0",
         "features": {
-            "dual_group_sizing": True,
-            "intelligent_height_calc": True,
-            "bullet_formatting": True,
-            "line_spacing": LINE_SPACING,
-            "group_1": GROUP_1_SHAPES,
-            "group_2": GROUP_2_SHAPES,
-            "min_font_size": MIN_FONT_SIZE,
-            "max_font_size": MAX_FONT_SIZE
+            "contexte_paragraphes": True,
+            "bullets_autres_zones": True,
+            "no_bullet_shapes": NO_BULLET_SHAPES
         }
     })
 
